@@ -1,0 +1,17 @@
+# uvreqs.txt
+# requirements when running the original code on colab
+
+# Specify the custom PyTorch wheel index
+--find-links https://download.pytorch.org/whl/torch_stable.html
+
+# PyTorch packages (will use the --find-links URL)
+torch==1.8.0+cu111
+torchvision==0.9.0+cu111
+torchaudio==0.8.0
+
+# Other packages (will be fetched from PyPI by default)
+easydict
+glob2
+numpy==1.24
+pyyaml
+tqdm
