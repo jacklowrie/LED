@@ -200,9 +200,9 @@ class Trainer:
     def p_sample_loop(self, x, mask, shape):
         self.model.eval()
         prediction_total = torch.Tensor().cuda()
-        for _ in range(20):
+        for _ in tqdm(range(20), desc="Sampling K", leave=False): # MOD: used tqdm. for _ in range(20)
             cur_y = torch.randn(shape).to(x.device)
-            for i in reversed(range(self.n_steps)):
+            for i in trange(self.n_steps - 1, -1, -1, desc="Denoise steps", leave=False): # MOD used tqdm. for i in reversed(range(self.n_steps)):
                 cur_y = self.p_sample(x, mask, cur_y, i)
             prediction_total = torch.cat((prediction_total, cur_y.unsqueeze(1)), dim=1)
         return prediction_total
@@ -226,10 +226,10 @@ class Trainer:
         '''
         prediction_total = torch.Tensor().cuda()
         cur_y = loc[:, :10]
-        for i in reversed(range(NUM_Tau)):
+        for i in trange(NUM_Tau - 1, -1, -1, desc="Accelerated denoise (1)", leave=False): # MOD used tqdm reversed(range(NUM_Tau)):
             cur_y = self.p_sample_accelerate(x, mask, cur_y, i)
         cur_y_ = loc[:, 10:]
-        for i in reversed(range(NUM_Tau)):
+        for i in trange(NUM_Tau - 1, -1, -1, desc="Accelerated denoise (2)", leave=False): # MOD used tqdm reversed(range(NUM_Tau)):
             cur_y_ = self.p_sample_accelerate(x, mask, cur_y_, i)
         # shape: B=b*n, K=10, T, 2
         prediction_total = torch.cat((cur_y_, cur_y), dim=1)
@@ -239,7 +239,7 @@ class Trainer:
 
     def fit(self):
         # Training loop
-        for epoch in range(0, self.cfg.num_epochs):
+        for epoch in trange(self.cfg.num_epochs, desc="Epochs"): # MOD used tqdm range(0, self.cfg.num_epochs):
             loss_total, loss_distance, loss_uncertainty = self._train_single_epoch(epoch)
             print_log('[{}] Epoch: {}\t\tLoss: {:.6f}\tLoss Dist.: {:.6f}\tLoss Uncertainty: {:.6f}'.format(
                 time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
@@ -394,7 +394,7 @@ class Trainer:
         root_path = './visualization/data/'
 
         with torch.no_grad():
-            for data in self.test_loader:
+            for data in tqdm(self.test_loader, desc="Saving viz batches"): # MOD used tqsm. self.test_loader:
                 _, traj_mask, past_traj, _ = self.data_preprocess(data)
 
                 sample_prediction, mean_estimation, variance_estimation = self.model_initializer(past_traj, traj_mask)
