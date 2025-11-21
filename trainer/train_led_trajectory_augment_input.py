@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 
 import os
 import time
@@ -17,7 +18,7 @@ from data.dataloader_nba import NBADataset, seq_collate
 from models.model_led_initializer import LEDInitializer as InitializationModel
 from models.model_diffusion import TransformerDenoisingModel as CoreDenoisingModel
 
-from tqdm.auto import tqdm, trange  # MOD: added tqdm
+from tqdm.auto import tqdm, trange  # <- added tqdm import
 
 import pdb
 NUM_Tau = 5
@@ -200,9 +201,9 @@ class Trainer:
     def p_sample_loop(self, x, mask, shape):
         self.model.eval()
         prediction_total = torch.Tensor().cuda()
-        for _ in tqdm(range(20), desc="Sampling K", leave=False): # MOD: used tqdm. for _ in range(20)
+        for _ in range(20):
             cur_y = torch.randn(shape).to(x.device)
-            for i in trange(self.n_steps - 1, -1, -1, desc="Denoise steps", leave=False): # MOD used tqdm. for i in reversed(range(self.n_steps)):
+            for i in reversed(range(self.n_steps)):
                 cur_y = self.p_sample(x, mask, cur_y, i)
             prediction_total = torch.cat((prediction_total, cur_y.unsqueeze(1)), dim=1)
         return prediction_total
@@ -226,11 +227,34 @@ class Trainer:
         '''
         prediction_total = torch.Tensor().cuda()
         cur_y = loc[:, :10]
-        for i in trange(NUM_Tau - 1, -1, -1, desc="Accelerated denoise (1)", leave=False): # MOD used tqdm reversed(range(NUM_Tau)):
+
+        # get outer bar (if present)
+        outer = getattr(self, '_active_tqdm', None)
+        substeps_per_batch = NUM_Tau * 2  # two passes, NUM_Tau steps each
+        per_step_inc = 1.0 / substeps_per_batch if substeps_per_batch > 0 else 1.0
+
+        if outer is not None and not getattr(outer, '_scaled_for_substeps', False):
+            old_total = int(getattr(outer, 'total', 0) or 0)
+            old_n = int(getattr(outer, 'n', 0) or 0)
+            # if outer.total is missing or 0, fallback to at least substeps_per_batch
+            outer.total = old_total * substeps_per_batch if old_total > 0 else substeps_per_batch
+            outer.n = old_n * substeps_per_batch if old_n > 0 else 0
+            outer.refresh()
+            outer._scaled_for_substeps = True
+
+        for i in reversed(range(NUM_Tau)):
             cur_y = self.p_sample_accelerate(x, mask, cur_y, i)
+            # MINIMAL PROGRESS UPDATE: advance outer bar fractionally
+            if outer is not None:
+                outer.update(1)
+
         cur_y_ = loc[:, 10:]
-        for i in trange(NUM_Tau - 1, -1, -1, desc="Accelerated denoise (2)", leave=False): # MOD used tqdm reversed(range(NUM_Tau)):
+        for i in reversed(range(NUM_Tau)):
             cur_y_ = self.p_sample_accelerate(x, mask, cur_y_, i)
+            # MINIMAL PROGRESS UPDATE: advance outer bar fractionally
+            if outer is not None:
+                outer.update(1)
+
         # shape: B=b*n, K=10, T, 2
         prediction_total = torch.cat((cur_y_, cur_y), dim=1)
         return prediction_total
@@ -239,7 +263,7 @@ class Trainer:
 
     def fit(self):
         # Training loop
-        for epoch in trange(self.cfg.num_epochs, desc="Epochs"): # MOD used tqdm range(0, self.cfg.num_epochs):
+        for epoch in range(0, self.cfg.num_epochs):
             loss_total, loss_distance, loss_uncertainty = self._train_single_epoch(epoch)
             print_log('[{}] Epoch: {}\t\tLoss: {:.6f}\tLoss Dist.: {:.6f}\tLoss Uncertainty: {:.6f}'.format(
                 time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
@@ -290,10 +314,9 @@ class Trainer:
         self.model_initializer.train()
         loss_total, loss_dt, loss_dc, count = 0, 0, 0, 0
 
-        # BEGIN MOD: added tqdm
+        # Use tqdm for the training data loader
         train_iter = tqdm(self.train_loader, desc=f"Train Epoch {epoch}")
         for data in train_iter:
-            # END MOD: added tqdm
             batch_size, traj_mask, past_traj, fut_traj = self.data_preprocess(data)
 
             sample_prediction, mean_estimation, variance_estimation = self.model_initializer(past_traj, traj_mask)
@@ -324,9 +347,8 @@ class Trainer:
             self.opt.step()
             count += 1
 
-            # BEGIN MOD: added tqdm
+            # update tqdm with current loss
             train_iter.set_postfix(loss=loss.item())
-            # END MOD: added tqdm
 
             if self.cfg.debug and count == 2:
                 break
@@ -346,10 +368,10 @@ class Trainer:
         prepare_seed(0)
         count = 0
         with torch.no_grad():
-            # BEGIN MOD: added tqdm
+            # Use tqdm for the test data loader
             test_iter = tqdm(self.test_loader, desc="Testing")
+            self._active_tqdm = test_iter
             for data in test_iter:
-                # END MOD: added tqdm
                 batch_size, traj_mask, past_traj, fut_traj = self.data_preprocess(data)
 
                 sample_prediction, mean_estimation, variance_estimation = self.model_initializer(past_traj, traj_mask)
@@ -369,12 +391,13 @@ class Trainer:
                 samples += distances.shape[0]
                 count += 1
 
-                # BEGIN MOD: added tqdm
+                # update tqdm with processed sample count
                 test_iter.set_postfix(samples=samples)
-                # END MOD: added tqdm
 
                 # if count==100:
                 # 	break
+            test_iter.close()
+            delattr(self, '_active_tqdm')
         return performance, samples
 
 
@@ -394,7 +417,7 @@ class Trainer:
         root_path = './visualization/data/'
 
         with torch.no_grad():
-            for data in tqdm(self.test_loader, desc="Saving viz batches"): # MOD used tqsm. self.test_loader:
+            for data in self.test_loader:
                 _, traj_mask, past_traj, _ = self.data_preprocess(data)
 
                 sample_prediction, mean_estimation, variance_estimation = self.model_initializer(past_traj, traj_mask)
@@ -433,10 +456,10 @@ class Trainer:
         prepare_seed(0)
         count = 0
         with torch.no_grad():
-            # BEGIN MOD: added tqdm
+            # Use tqdm for the test data loader here as well
             test_iter = tqdm(self.test_loader, desc="Testing (single model)")
+            self._active_tqdm = test_iter
             for data in test_iter:
-                # END MOD: added tqdm
                 batch_size, traj_mask, past_traj, fut_traj = self.data_preprocess(data)
 
                 sample_prediction, mean_estimation, variance_estimation = self.model_initializer(past_traj, traj_mask)
@@ -456,13 +479,14 @@ class Trainer:
                 samples += distances.shape[0]
                 count += 1
 
-                # BEGIN MOD: added tqdm
+                # update tqdm with processed sample count
                 test_iter.set_postfix(samples=samples)
-                # END MOD: added tqdm
-
+            test_iter.close()
+            delattr(self, '_active_tqdm')
                     # if count==2:
                     # 	break
         for time_i in range(4):
             print_log('--ADE({}s): {:.4f}\t--FDE({}s): {:.4f}'.format(time_i+1, performance['ADE'][time_i]/samples, \
                 time_i+1, performance['FDE'][time_i]/samples), log=self.log)
+
 
