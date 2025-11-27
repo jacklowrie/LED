@@ -1,0 +1,16 @@
+[project]
+name = "led"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "easydict>=1.13",
+    "glob2>=0.7",
+    "numpy==1.24",
+    "pyyaml>=6.0.3",
+    "torch==1.13.1",
+    "torchaudio>=0.13.1",
+    "torchvision>=0.14.1",
+    "tqdm>=4.67.1",
+]
