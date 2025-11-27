@@ -194,6 +194,17 @@ class Trainer:
         # Fixed sigma
         sigma_t = self.extract(self.betas, t, cur_y).sqrt()
         sample = mean + sigma_t * z * 0.00001
+
+
+        # MODIFICATION Progress bar update: if an outer tqdm has been set by the caller, update it for this substep
+        outer = getattr(self, '_active_tqdm', None)
+        if outer is not None:
+            try:
+                outer.update(1)
+            except Exception:
+                pass
+       # END MODIFICATION
+
         return (sample)
 
 
@@ -227,34 +238,11 @@ class Trainer:
         '''
         prediction_total = torch.Tensor().cuda()
         cur_y = loc[:, :10]
-
-        # get outer bar (if present)
-        outer = getattr(self, '_active_tqdm', None)
-        substeps_per_batch = NUM_Tau * 2  # two passes, NUM_Tau steps each
-        per_step_inc = 1.0 / substeps_per_batch if substeps_per_batch > 0 else 1.0
-
-        if outer is not None and not getattr(outer, '_scaled_for_substeps', False):
-            old_total = int(getattr(outer, 'total', 0) or 0)
-            old_n = int(getattr(outer, 'n', 0) or 0)
-            # if outer.total is missing or 0, fallback to at least substeps_per_batch
-            outer.total = old_total * substeps_per_batch if old_total > 0 else substeps_per_batch
-            outer.n = old_n * substeps_per_batch if old_n > 0 else 0
-            outer.refresh()
-            outer._scaled_for_substeps = True
-
         for i in reversed(range(NUM_Tau)):
             cur_y = self.p_sample_accelerate(x, mask, cur_y, i)
-            # MINIMAL PROGRESS UPDATE: advance outer bar fractionally
-            if outer is not None:
-                outer.update(1)
-
         cur_y_ = loc[:, 10:]
         for i in reversed(range(NUM_Tau)):
             cur_y_ = self.p_sample_accelerate(x, mask, cur_y_, i)
-            # MINIMAL PROGRESS UPDATE: advance outer bar fractionally
-            if outer is not None:
-                outer.update(1)
-
         # shape: B=b*n, K=10, T, 2
         prediction_total = torch.cat((cur_y_, cur_y), dim=1)
         return prediction_total
@@ -368,10 +356,14 @@ class Trainer:
         prepare_seed(0)
         count = 0
         with torch.no_grad():
-            # Use tqdm for the test data loader
-            test_iter = tqdm(self.test_loader, desc="Testing")
-            self._active_tqdm = test_iter
-            for data in test_iter:
+            # BEGIN MODIFICATION: create manually-sized outer tqdm and let p_sample_accelerate update it
+            substeps_per_batch = NUM_Tau * 2
+            total_batches = len(self.test_loader)
+            outer = tqdm(total=total_batches * substeps_per_batch, desc="Testing")
+            self._active_tqdm = outer
+            # END MODIFICATION: create manually-sized outer tqdm and let p_sample_accelerate update it
+
+            for data in self.test_loader:
                 batch_size, traj_mask, past_traj, fut_traj = self.data_preprocess(data)
 
                 sample_prediction, mean_estimation, variance_estimation = self.model_initializer(past_traj, traj_mask)
@@ -392,11 +384,11 @@ class Trainer:
                 count += 1
 
                 # update tqdm with processed sample count
-                test_iter.set_postfix(samples=samples)
+                outer.set_postfix(samples=samples)
 
                 # if count==100:
                 # 	break
-            test_iter.close()
+            outer.close()
             delattr(self, '_active_tqdm')
         return performance, samples
 
@@ -456,10 +448,14 @@ class Trainer:
         prepare_seed(0)
         count = 0
         with torch.no_grad():
-            # Use tqdm for the test data loader here as well
-            test_iter = tqdm(self.test_loader, desc="Testing (single model)")
-            self._active_tqdm = test_iter
-            for data in test_iter:
+            # BEGIN MODIFICATION: create manually-sized outer tqdm and let p_sample_accelerate update it
+            substeps_per_batch = NUM_Tau * 2
+            total_batches = len(self.test_loader)
+            outer = tqdm(total=total_batches * substeps_per_batch, desc="Testing (single model)")
+            self._active_tqdm = outer
+            # END MODIFICATION: create manually-sized outer tqdm and let p_sample_accelerate update it
+
+            for data in self.test_loader:
                 batch_size, traj_mask, past_traj, fut_traj = self.data_preprocess(data)
 
                 sample_prediction, mean_estimation, variance_estimation = self.model_initializer(past_traj, traj_mask)
@@ -480,8 +476,8 @@ class Trainer:
                 count += 1
 
                 # update tqdm with processed sample count
-                test_iter.set_postfix(samples=samples)
-            test_iter.close()
+                outer.set_postfix(samples=samples)
+            outer.close()
             delattr(self, '_active_tqdm')
                     # if count==2:
                     # 	break
