@@ -22,6 +22,7 @@ from tqdm.auto import tqdm  # <- added tqdm import
 from datetime import datetime
 
 import pdb
+from torch.cuda import amp
 
 NUM_Tau = 5
 
@@ -49,6 +50,7 @@ class Trainer:
             collate_fn=seq_collate,
             pin_memory=True,
             persistent_workers=(num_workers > 0),
+            prefetch_factor=4,
         )
 
         test_dset = NBADataset(
@@ -65,12 +67,12 @@ class Trainer:
             collate_fn=seq_collate,
             pin_memory=True,
             persistent_workers=(num_workers > 0),
+            prefetch_factor=4,
         )
 
-        # data normalization parameters
+        # data normalization parameters (create directly on target device)
         self.traj_mean = (
-            torch.FloatTensor(self.cfg.traj_mean)
-            .cuda()
+            torch.tensor(self.cfg.traj_mean, dtype=torch.float, device=self.device)
             .unsqueeze(0)
             .unsqueeze(0)
             .unsqueeze(0)
@@ -81,29 +83,58 @@ class Trainer:
         self.n_steps = self.cfg.diffusion.steps  # define total diffusion steps
 
         # make beta schedule and calculate the parameters used in denoising process.
+        # Create schedule directly on the trainer device to avoid copies
         self.betas = self.make_beta_schedule(
             schedule=self.cfg.diffusion.beta_schedule,
             n_timesteps=self.n_steps,
             start=self.cfg.diffusion.beta_start,
             end=self.cfg.diffusion.beta_end,
-        ).cuda()
+        ).to(self.device)
 
         self.alphas = 1 - self.betas
         self.alphas_prod = torch.cumprod(self.alphas, 0)
         self.alphas_bar_sqrt = torch.sqrt(self.alphas_prod)
         self.one_minus_alphas_bar_sqrt = torch.sqrt(1 - self.alphas_prod)
 
+        # Precompute timestep-dependent constants on device to avoid repeated
+        # arithmetic inside inner sampling loops.
+        self._inv_sqrt_alphas = (1.0 / self.alphas.sqrt()).to(self.device)
+        self._sigma = self.betas.sqrt().to(self.device)
+        self._eps_factor = ((1 - self.alphas) / self.one_minus_alphas_bar_sqrt).to(
+            self.device
+        )
+
+        # Prebuild a small cache of timestep scalars on device to avoid
+        # allocating a full-size index tensor on every inner sampling step.
+        # We'll expand these single-element tensors to the batch size when used.
+        self._t_idx_cache = [
+            torch.tensor([i], dtype=torch.long, device=self.device)
+            for i in range(self.n_steps)
+        ]
+
         # ------------------------- define models -------------------------
-        self.model = CoreDenoisingModel().cuda()
+        self.model = CoreDenoisingModel().to(self.device)
         # load pretrained models
         model_cp = torch.load(
             self.cfg.pretrained_core_denoising_model, map_location="cpu"
         )
         self.model.load_state_dict(model_cp["model_dict"])
 
+        # Freeze pretrained core denoiser (train initializer only, per paper)
+        for p in self.model.parameters():
+            p.requires_grad = False
+        self.model.eval()
+
         self.model_initializer = InitializationModel(
             t_h=10, d_h=6, t_f=20, d_f=2, k_pred=20
-        ).cuda()
+        ).to(self.device)
+
+        # AMP configuration: enable only if requested and CUDA available
+        self.use_amp = bool(
+            getattr(config, "use_amp", False) and torch.cuda.is_available()
+        )
+        if self.use_amp:
+            self.scaler = amp.GradScaler()
 
         self.opt = torch.optim.AdamW(
             self.model_initializer.parameters(), lr=config.learning_rate
@@ -120,10 +151,11 @@ class Trainer:
         self.print_model_param(self.model, name="Core Denoising Model")
         self.print_model_param(self.model_initializer, name="Initialization Model")
 
-        # temporal reweight in the loss, it is not necessary.
+        # temporal reweight in the loss, create on-device to avoid copies
         self.temporal_reweight = (
-            torch.FloatTensor([21 - i for i in range(1, 21)])
-            .cuda()
+            torch.tensor(
+                [21 - i for i in range(1, 21)], dtype=torch.float, device=self.device
+            )
             .unsqueeze(0)
             .unsqueeze(0)
             / 10
@@ -198,14 +230,20 @@ class Trainer:
 
     def extract(self, input, t, x):
         shape = x.shape
-        out = torch.gather(input, 0, t.to(input.device))
+        # Avoid calling .to(...) on every inner loop iteration. Only move
+        # `t` to the input device if it's not already there. In our sampling
+        # code we ensure `t` is created on the correct device, so this branch
+        # will almost always be a no-op and avoids repeated small copies.
+        if t.device != input.device:
+            t = t.to(input.device)
+        out = torch.gather(input, 0, t)
         reshape = [t.shape[0]] + [1] * (len(shape) - 1)
         return out.reshape(*reshape)
 
     def noise_estimation_loss(self, x, y_0, mask):
         batch_size = x.shape[0]
         # Select a random step for each example
-        t = torch.randint(0, self.n_steps, size=(batch_size // 2 + 1,)).to(x.device)
+        t = torch.randint(0, self.n_steps, size=(batch_size // 2 + 1,), device=x.device)
         t = torch.cat([t, self.n_steps - t - 1], dim=0)[:batch_size]
         # x0 multiplier
         a = self.extract(self.alphas_bar_sqrt, t, y_0)
@@ -215,83 +253,98 @@ class Trainer:
         e = torch.randn_like(y_0)
         # model input
         y = y_0 * a + e * am1
-        output = self.model(y, beta, x, mask)
+        # Use autocast for model forward if AMP is enabled
+        with amp.autocast(enabled=self.use_amp):
+            output = self.model(y, beta, x, mask)
         # batch_size, 20, 2
         return (e - output).square().mean()
 
     def p_sample(self, x, mask, cur_y, t):
-        if t == 0:
-            z = torch.zeros_like(cur_y).to(x.device)
-        else:
-            z = torch.randn_like(cur_y).to(x.device)
-        t = torch.tensor([t]).cuda()
-        # Factor to the model output
-        eps_factor = (1 - self.extract(self.alphas, t, cur_y)) / self.extract(
-            self.one_minus_alphas_bar_sqrt, t, cur_y
-        )
+        # Use cached single-element timestep tensor and expand to batch size
+        t_idx = self._t_idx_cache[t].expand(x.shape[0])
+
+        # Use precomputed per-timestep constants and reshape for broadcasting
+        reshape = [t_idx.shape[0]] + [1] * (cur_y.dim() - 1)
+        eps_factor = self._eps_factor[t_idx].reshape(*reshape)
+        beta = self.betas[t_idx].reshape(*reshape)
+        inv_sqrt_alpha = self._inv_sqrt_alphas[t_idx].reshape(*reshape)
+
         # Model output
-        beta = self.extract(self.betas, t.repeat(x.shape[0]), cur_y)
-        eps_theta = self.model(cur_y, beta, x, mask)
-        mean = (1 / self.extract(self.alphas, t, cur_y).sqrt()) * (
-            cur_y - (eps_factor * eps_theta)
-        )
-        # Generate z
-        z = torch.randn_like(cur_y).to(x.device)
-        # Fixed sigma
-        sigma_t = self.extract(self.betas, t, cur_y).sqrt()
+        with amp.autocast(enabled=self.use_amp):
+            eps_theta = self.model(cur_y, beta, x, mask)
+        mean = inv_sqrt_alpha * (cur_y - (eps_factor * eps_theta))
+
+        # Generate z in-place to avoid extra allocations
+        z = torch.empty_like(cur_y).normal_()
+
+        # Fixed sigma (precomputed)
+        sigma_t = self._sigma[t_idx].reshape(*reshape)
         sample = mean + sigma_t * z
         return sample
 
-    def p_sample_accelerate(self, x, mask, cur_y, t):
-        if t == 0:
-            z = torch.zeros_like(cur_y).to(x.device)
-        else:
-            z = torch.randn_like(cur_y).to(x.device)
-        t = torch.tensor([t]).cuda()
-        # Factor to the model output
-        eps_factor = (1 - self.extract(self.alphas, t, cur_y)) / self.extract(
-            self.one_minus_alphas_bar_sqrt, t, cur_y
-        )
-        # Model output
-        beta = self.extract(self.betas, t.repeat(x.shape[0]), cur_y)
-        eps_theta = self.model.generate_accelerate(cur_y, beta, x, mask)
-        mean = (1 / self.extract(self.alphas, t, cur_y).sqrt()) * (
-            cur_y - (eps_factor * eps_theta)
-        )
-        # Generate z
-        z = torch.randn_like(cur_y).to(x.device)
-        # Fixed sigma
-        sigma_t = self.extract(self.betas, t, cur_y).sqrt()
+    def p_sample_accelerate(self, cur_y, t, context_encoded, z=None):
+        """Accelerated sample step that accepts a precomputed context encoding.
+
+        Arguments:
+        - cur_y: current noisy sample tensor
+        - t: timestep (int)
+        - context_encoded: output of self.model.encoder_context(x, mask)
+        """
+        # Use cached single-element timestep tensor and expand to batch size
+        t_idx = self._t_idx_cache[t].expand(cur_y.shape[0])
+
+        reshape = [t_idx.shape[0]] + [1] * (cur_y.dim() - 1)
+        eps_factor = self._eps_factor[t_idx].reshape(*reshape)
+        beta = self.betas[t_idx].reshape(*reshape)
+        inv_sqrt_alpha = self._inv_sqrt_alphas[t_idx].reshape(*reshape)
+
+        # Model output using pre-encoded context (avoids re-running encoder)
+        with amp.autocast(enabled=self.use_amp):
+            eps_theta = self.model.generate_accelerate_encoded(
+                cur_y, beta, context_encoded
+            )
+        mean = inv_sqrt_alpha * (cur_y - (eps_factor * eps_theta))
+
+        # Use caller-provided noise if available (pre-generated), else create
+        if z is None:
+            z = torch.empty_like(cur_y).normal_()
+
+        # Fixed sigma (precomputed)
+        sigma_t = self._sigma[t_idx].reshape(*reshape)
         sample = mean + sigma_t * z * 0.00001
 
-        # MODIFICATION Progress bar update: if an outer tqdm has been set by the caller, update it for this substep
+        # Progress bar update: if an outer tqdm has been set by the caller, update it for this substep
         outer = getattr(self, "_active_tqdm", None)
         if outer is not None:
             try:
                 outer.update(1)
             except Exception:
                 pass
-        # END MODIFICATION
 
         return sample
 
     def p_sample_loop(self, x, mask, shape):
         self.model.eval()
-        prediction_total = torch.Tensor().cuda()
+        predictions = []
         for _ in range(20):
-            cur_y = torch.randn(shape).to(x.device)
+            cur_y = torch.randn(shape, device=x.device)
             for i in reversed(range(self.n_steps)):
                 cur_y = self.p_sample(x, mask, cur_y, i)
-            prediction_total = torch.cat((prediction_total, cur_y.unsqueeze(1)), dim=1)
+            predictions.append(cur_y.unsqueeze(1))
+        prediction_total = torch.cat(predictions, dim=1)
         return prediction_total
 
     def p_sample_loop_mean(self, x, mask, loc):
-        prediction_total = torch.Tensor().cuda()
+        predictions = []
         for loc_i in range(1):
             cur_y = loc
             for i in reversed(range(NUM_Tau)):
                 cur_y = self.p_sample(x, mask, cur_y, i)
-            prediction_total = torch.cat((prediction_total, cur_y.unsqueeze(1)), dim=1)
+            predictions.append(cur_y.unsqueeze(1))
+        if len(predictions) > 0:
+            prediction_total = torch.cat(predictions, dim=1)
+        else:
+            prediction_total = torch.empty(0, device=x.device)
         return prediction_total
 
     def p_sample_loop_accelerate(self, x, mask, loc):
@@ -302,14 +355,21 @@ class Trainer:
         mask: [11, 11]
         cur_y: [11, 10, 20, 2]
         """
-        prediction_total = torch.Tensor().cuda()
+        # Precompute the encoder context once for the whole batch to avoid repeated encoder work
+        context_encoded = self.model.encoder_context(x, mask)
+
         cur_y = loc[:, :10]
+        # Pre-generate noise for the accelerated small loop to avoid per-step allocations
+        noise_seq = torch.randn((NUM_Tau,) + cur_y.shape, device=cur_y.device)
         for i in reversed(range(NUM_Tau)):
-            cur_y = self.p_sample_accelerate(x, mask, cur_y, i)
+            cur_y = self.p_sample_accelerate(cur_y, i, context_encoded, z=noise_seq[i])
         cur_y_ = loc[:, 10:]
+        noise_seq2 = torch.randn((NUM_Tau,) + cur_y_.shape, device=cur_y_.device)
         for i in reversed(range(NUM_Tau)):
-            cur_y_ = self.p_sample_accelerate(x, mask, cur_y_, i)
-        # shape: B=b*n, K=10, T, 2
+            cur_y_ = self.p_sample_accelerate(
+                cur_y_, i, context_encoded, z=noise_seq2[i]
+            )
+        # shape: B=b*n, K=10, T, 2 -- concatenate the two halves once
         prediction_total = torch.cat((cur_y_, cur_y), dim=1)
         return prediction_total
 
@@ -361,22 +421,29 @@ class Trainer:
         """
         batch_size = data["pre_motion_3D"].shape[0]
 
-        traj_mask = torch.zeros(batch_size * 11, batch_size * 11).cuda()
-        for i in range(batch_size):
-            traj_mask[i * 11 : (i + 1) * 11, i * 11 : (i + 1) * 11] = 1.0
+        device = self.device
+        # build block-diagonal trajectory mask directly on device
+        block = torch.ones((11, 11), device=device)
+        eye = torch.eye(batch_size, device=device)
+        traj_mask = torch.kron(eye, block)
 
-        initial_pos = data["pre_motion_3D"].cuda()[:, :, -1:]
+        # Move batch tensors to device once and reuse local references
+        # Use non-blocking transfers from pinned memory (DataLoader has pin_memory=True)
+        pre_motion = data["pre_motion_3D"].to(device, non_blocking=True)
+        fut_motion = data["fut_motion_3D"].to(device, non_blocking=True)
+
+        initial_pos = pre_motion[:, :, -1:]
+
         # augment input: absolute position, relative position, velocity
         past_traj_abs = (
-            ((data["pre_motion_3D"].cuda() - self.traj_mean) / self.traj_scale)
+            ((pre_motion - self.traj_mean) / self.traj_scale)
             .contiguous()
             .view(-1, 10, 2)
         )
         past_traj_rel = (
-            ((data["pre_motion_3D"].cuda() - initial_pos) / self.traj_scale)
-            .contiguous()
-            .view(-1, 10, 2)
+            ((pre_motion - initial_pos) / self.traj_scale).contiguous().view(-1, 10, 2)
         )
+
         past_traj_vel = torch.cat(
             (
                 past_traj_rel[:, 1:] - past_traj_rel[:, :-1],
@@ -384,13 +451,13 @@ class Trainer:
             ),
             dim=1,
         )
+
         past_traj = torch.cat((past_traj_abs, past_traj_rel, past_traj_vel), dim=-1)
 
         fut_traj = (
-            ((data["fut_motion_3D"].cuda() - initial_pos) / self.traj_scale)
-            .contiguous()
-            .view(-1, 20, 2)
+            ((fut_motion - initial_pos) / self.traj_scale).contiguous().view(-1, 20, 2)
         )
+
         return batch_size, traj_mask, past_traj, fut_traj
 
     def _train_single_epoch(self, epoch):
@@ -403,9 +470,11 @@ class Trainer:
         for data in train_iter:
             batch_size, traj_mask, past_traj, fut_traj = self.data_preprocess(data)
 
-            sample_prediction, mean_estimation, variance_estimation = (
-                self.model_initializer(past_traj, traj_mask)
-            )
+            # Use autocast for initializer forward when AMP is enabled
+            with amp.autocast(enabled=self.use_amp):
+                sample_prediction, mean_estimation, variance_estimation = (
+                    self.model_initializer(past_traj, traj_mask)
+                )
             sample_prediction = (
                 torch.exp(variance_estimation / 2)[..., None, None]
                 * sample_prediction
@@ -438,9 +507,17 @@ class Trainer:
             loss_dc += loss_uncertainty.item()
 
             self.opt.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model_initializer.parameters(), 1.0)
-            self.opt.step()
+            if self.use_amp:
+                # scaled backward + unscale for gradient clipping
+                self.scaler.scale(loss).backward()
+                self.scaler.unscale_(self.opt)
+                torch.nn.utils.clip_grad_norm_(self.model_initializer.parameters(), 1.0)
+                self.scaler.step(self.opt)
+                self.scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model_initializer.parameters(), 1.0)
+                self.opt.step()
             count += 1
 
             # update tqdm with current loss
@@ -452,7 +529,21 @@ class Trainer:
         return loss_total / count, loss_dt / count, loss_dc / count
 
     def _test_single_epoch(self):
-        performance = {"FDE": [0, 0, 0, 0], "ADE": [0, 0, 0, 0]}
+        # Accumulate metrics on device to avoid repeated CPU syncs
+        performance_acc = {
+            "FDE": [
+                torch.tensor(0.0, device=self.device),
+                torch.tensor(0.0, device=self.device),
+                torch.tensor(0.0, device=self.device),
+                torch.tensor(0.0, device=self.device),
+            ],
+            "ADE": [
+                torch.tensor(0.0, device=self.device),
+                torch.tensor(0.0, device=self.device),
+                torch.tensor(0.0, device=self.device),
+                torch.tensor(0.0, device=self.device),
+            ],
+        }
         samples = 0
 
         def prepare_seed(rand_seed):
@@ -474,9 +565,10 @@ class Trainer:
             for data in self.test_loader:
                 batch_size, traj_mask, past_traj, fut_traj = self.data_preprocess(data)
 
-                sample_prediction, mean_estimation, variance_estimation = (
-                    self.model_initializer(past_traj, traj_mask)
-                )
+                with amp.autocast(enabled=self.use_amp):
+                    sample_prediction, mean_estimation, variance_estimation = (
+                        self.model_initializer(past_traj, traj_mask)
+                    )
                 sample_prediction = (
                     torch.exp(variance_estimation / 2)[..., None, None]
                     * sample_prediction
@@ -497,8 +589,9 @@ class Trainer:
                         .sum()
                     )
                     fde = (distances[:, :, 5 * time_i - 1]).min(dim=-1)[0].sum()
-                    performance["ADE"][time_i - 1] += ade.item()
-                    performance["FDE"][time_i - 1] += fde.item()
+                    # Accumulate on device tensors to avoid CPU sync on each batch
+                    performance_acc["ADE"][time_i - 1] += ade
+                    performance_acc["FDE"][time_i - 1] += fde
                 samples += distances.shape[0]
                 count += 1
 
@@ -509,6 +602,11 @@ class Trainer:
                 # 	break
             outer.close()
             delattr(self, "_active_tqdm")
+        # Convert accumulated tensors to Python floats before returning (fits existing callers)
+        performance = {
+            "ADE": [performance_acc["ADE"][i].cpu().item() for i in range(4)],
+            "FDE": [performance_acc["FDE"][i].cpu().item() for i in range(4)],
+        }
         return performance, samples
 
     def save_data(self):
@@ -534,9 +632,10 @@ class Trainer:
             for data in self.test_loader:
                 _, traj_mask, past_traj, _ = self.data_preprocess(data)
 
-                sample_prediction, mean_estimation, variance_estimation = (
-                    self.model_initializer(past_traj, traj_mask)
-                )
+                with amp.autocast(enabled=self.use_amp):
+                    sample_prediction, mean_estimation, variance_estimation = (
+                        self.model_initializer(past_traj, traj_mask)
+                    )
                 torch.save(sample_prediction, root_path + "p_var.pt")
                 torch.save(mean_estimation, root_path + "p_mean.pt")
                 torch.save(variance_estimation, root_path + "p_sigma.pt")
@@ -566,7 +665,23 @@ class Trainer:
             "model_initializer_dict"
         ]
         self.model_initializer.load_state_dict(model_dict)
-        performance = {"FDE": [0, 0, 0, 0], "ADE": [0, 0, 0, 0]}
+        # Use torch tensors for accumulation to avoid many .item() CPU syncs
+        # Create accumulation tensors directly on the trainer device to avoid
+        # small CPU->GPU allocations during repeated adds in the inner loop.
+        performance = {
+            "FDE": [
+                torch.tensor(0.0, device=self.device),
+                torch.tensor(0.0, device=self.device),
+                torch.tensor(0.0, device=self.device),
+                torch.tensor(0.0, device=self.device),
+            ],
+            "ADE": [
+                torch.tensor(0.0, device=self.device),
+                torch.tensor(0.0, device=self.device),
+                torch.tensor(0.0, device=self.device),
+                torch.tensor(0.0, device=self.device),
+            ],
+        }
         samples = 0
         print_log(model_path, log=self.log)
 
@@ -614,8 +729,13 @@ class Trainer:
                         .sum()
                     )
                     fde = (distances[:, :, 5 * time_i - 1]).min(dim=-1)[0].sum()
-                    performance["ADE"][time_i - 1] += ade.item()
-                    performance["FDE"][time_i - 1] += fde.item()
+                    # accumulate as tensors (on GPU) then move minimal data only when needed
+                    performance["ADE"][time_i - 1] = (
+                        performance["ADE"][time_i - 1] + ade
+                    )
+                    performance["FDE"][time_i - 1] = (
+                        performance["FDE"][time_i - 1] + fde
+                    )
                 samples += distances.shape[0]
                 count += 1
 
@@ -625,13 +745,16 @@ class Trainer:
             delattr(self, "_active_tqdm")
             # if count==2:
             # 	break
+        # Move accumulated tensors to CPU and log once
         for time_i in range(4):
+            ade_val = performance["ADE"][time_i].cpu().item() / samples
+            fde_val = performance["FDE"][time_i].cpu().item() / samples
             print_log(
                 "--ADE({}s): {:.4f}\t--FDE({}s): {:.4f}".format(
                     time_i + 1,
-                    performance["ADE"][time_i] / samples,
+                    ade_val,
                     time_i + 1,
-                    performance["FDE"][time_i] / samples,
+                    fde_val,
                 ),
                 log=self.log,
             )

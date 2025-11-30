@@ -151,3 +151,37 @@ class TransformerDenoisingModel(Module):
         trans = self.concat3.batch_generate(ctx_emb, trans)
         trans = self.concat4.batch_generate(ctx_emb, trans)
         return self.linear.batch_generate(ctx_emb, trans)
+
+    def generate_accelerate_encoded(self, x, beta, context_encoded):
+        """
+        Same as generate_accelerate but accepts a precomputed context encoding
+        (output of self.encoder_context(context, mask)) so the expensive
+        encoder step need not be repeated per diffusion timestep.
+
+        x: cur_y tensor (batch, K, T, 2) or similar
+        beta: time-level tensor with shape (batch,)
+        context_encoded: encoder output with shape (batch, 1, F)
+        """
+        batch_size = x.size(0)
+        beta = beta.view(beta.size(0), 1, 1)  # (B, 1, 1)
+
+        # context_encoded is assumed to be already encoded by encoder_context
+        time_emb = torch.cat([beta, torch.sin(beta), torch.cos(beta)], dim=-1)
+        # ctx_emb: (B, 1, F+3) -> repeat to match K and unsqueeze for batch_generate ops
+        ctx_emb = (
+            torch.cat([time_emb, context_encoded], dim=-1).repeat(1, 10, 1).unsqueeze(2)
+        )
+
+        x = self.concat1.batch_generate(ctx_emb, x).contiguous().view(-1, 20, 512)
+        final_emb = x.permute(1, 0, 2)
+        final_emb = self.pos_emb(final_emb)
+
+        trans = (
+            self.transformer_encoder(final_emb)
+            .permute(1, 0, 2)
+            .contiguous()
+            .view(-1, 10, 20, 512)
+        )
+        trans = self.concat3.batch_generate(ctx_emb, trans)
+        trans = self.concat4.batch_generate(ctx_emb, trans)
+        return self.linear.batch_generate(ctx_emb, trans)

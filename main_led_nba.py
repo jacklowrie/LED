@@ -1,5 +1,7 @@
 import argparse
 from trainer import train_led_trajectory_augment_input as led
+import torch
+import os
 
 
 def parse_config():
@@ -7,6 +9,7 @@ def parse_config():
     parser.add_argument("--cuda", default=True)
     parser.add_argument("--learning_rate", type=int, default=0.002)
     parser.add_argument("--max_epochs", type=int, default=128)
+    parser.add_argument("--use_amp", action="store_true", help="Enable AMP mixed precision")
 
     parser.add_argument("--cfg", default="led_augment")
     parser.add_argument("--gpu", type=int, default=0, help="Specify which GPU to use.")
