@@ -23,7 +23,6 @@ def parse_config():
         default="",
         help="Name of the experiment. It will be used in file creation.",
     )
-
     return parser.parse_args()
 
 
