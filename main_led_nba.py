@@ -11,6 +11,9 @@ def parse_config():
     parser.add_argument("--cfg", default="led_augment")
     parser.add_argument("--gpu", type=int, default=0, help="Specify which GPU to use.")
     parser.add_argument(
+        "--workers", type=int, default=-1, help="Number of data loading workers."
+    )
+    parser.add_argument(
         "--train", type=int, default=1, help="Whether train or evaluate."
     )
 

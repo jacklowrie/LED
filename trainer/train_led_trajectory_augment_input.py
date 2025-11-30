@@ -18,7 +18,8 @@ from data.dataloader_nba import NBADataset, seq_collate
 from models.model_led_initializer import LEDInitializer as InitializationModel
 from models.model_diffusion import TransformerDenoisingModel as CoreDenoisingModel
 
-from tqdm.auto import tqdm, trange  # <- added tqdm import
+from tqdm.auto import tqdm  # <- added tqdm import
+from datetime import datetime
 
 import pdb
 
@@ -29,6 +30,7 @@ class Trainer:
     def __init__(self, config):
         if torch.cuda.is_available():
             torch.cuda.set_device(config.gpu)
+            torch.backends.cudnn.benchmark = True
         self.device = torch.device("cuda") if config.cuda else torch.device("cpu")
         self.cfg = Config(config.cfg, config.info)
 
@@ -37,13 +39,16 @@ class Trainer:
             obs_len=self.cfg.past_frames, pred_len=self.cfg.future_frames, training=True
         )
 
+        # choose workers (honors explicit config, otherwise cores-based)
+        num_workers = self._choose_num_workers(config)
         self.train_loader = DataLoader(
             train_dset,
             batch_size=self.cfg.train_batch_size,
             shuffle=True,
-            num_workers=4,
+            num_workers=num_workers,
             collate_fn=seq_collate,
             pin_memory=True,
+            persistent_workers=(num_workers > 0),
         )
 
         test_dset = NBADataset(
@@ -56,9 +61,10 @@ class Trainer:
             test_dset,
             batch_size=self.cfg.test_batch_size,
             shuffle=False,
-            num_workers=4,
+            num_workers=num_workers,
             collate_fn=seq_collate,
             pin_memory=True,
+            persistent_workers=(num_workers > 0),
         )
 
         # data normalization parameters
@@ -108,6 +114,9 @@ class Trainer:
 
         # ------------------------- prepare logs -------------------------
         self.log = open(os.path.join(self.cfg.log_dir, "log.txt"), "a+")
+        print_log(
+            f"NEW RUN AT: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", self.log
+        )
         self.print_model_param(self.model, name="Core Denoising Model")
         self.print_model_param(self.model_initializer, name="Initialization Model")
 
@@ -131,6 +140,30 @@ class Trainer:
             self.log,
         )
         return None
+
+    def _choose_num_workers(self, config):
+        """Simplified workers selection.
+
+        Rules:
+        - If `config.workers` is provided and >= 0, use it (explicit override).
+        - Otherwise choose based on CPU cores: `min(cores-1, cap)` with a small cap.
+        """
+        # explicit override from CLI/config
+        try:
+            w_cfg = getattr(config, "workers", None)
+            if w_cfg is not None:
+                w = int(w_cfg)
+                if w >= 0:
+                    print(f"Using user-provided workers={w}")
+                    return w
+        except Exception:
+            pass
+
+        cores = os.cpu_count() or 2
+        cap = 8
+        w = max(1, min(cores - 1, cap))
+        print(f"Auto-selected workers={w} based on cores={cores}")
+        return w
 
     def make_beta_schedule(
         self,
