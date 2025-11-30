@@ -10,7 +10,8 @@ dependencies = [
     "numpy==1.24",
     "pyyaml>=6.0.3",
     "tqdm>=4.67.1",
-    "torch==1.13.1",
-    "torchaudio>=0.13.1",
-    "torchvision>=0.14.1",
+    # Pytorch (original 1.8.0+cu111, good up to 1.13.1+cu117)
+    "torch==1.8.1",
+    "torchaudio>=0.9.1",
+    "torchvision>=0.8.1",
 ]
