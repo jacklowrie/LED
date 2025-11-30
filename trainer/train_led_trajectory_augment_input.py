@@ -18,7 +18,8 @@ from data.dataloader_nba import NBADataset, seq_collate
 from models.model_led_initializer import LEDInitializer as InitializationModel
 from models.model_diffusion import TransformerDenoisingModel as CoreDenoisingModel
 
-from tqdm.auto import tqdm, trange  # <- added tqdm import
+from tqdm.auto import tqdm  # <- added tqdm import
+from datetime import datetime
 
 import pdb
 
@@ -113,6 +114,9 @@ class Trainer:
 
         # ------------------------- prepare logs -------------------------
         self.log = open(os.path.join(self.cfg.log_dir, "log.txt"), "a+")
+        print_log(
+            f"NEW RUN AT: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", self.log
+        )
         self.print_model_param(self.model, name="Core Denoising Model")
         self.print_model_param(self.model_initializer, name="Initialization Model")
 
