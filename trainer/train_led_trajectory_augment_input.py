@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 
 import os
+import gc
+
 import time
 import torch
+
+
 import random
 import numpy as np
 import torch.nn as nn
 
 from utils.config import Config
 from utils.utils import print_log
+from utils.memory import print_mem
 
 
 from torch.utils.data import DataLoader
@@ -39,36 +44,54 @@ class Trainer:
         train_dset = NBADataset(
             obs_len=self.cfg.past_frames, pred_len=self.cfg.future_frames, training=True
         )
-
-        # choose workers (honors explicit config, otherwise cores-based)
-        num_workers = self._choose_num_workers(config)
-        self.train_loader = DataLoader(
-            train_dset,
-            batch_size=self.cfg.train_batch_size,
-            shuffle=True,
-            num_workers=num_workers,
-            collate_fn=seq_collate,
-            pin_memory=True,
-            persistent_workers=(num_workers > 0),
-            prefetch_factor=4,
-        )
-
         test_dset = NBADataset(
             obs_len=self.cfg.past_frames,
             pred_len=self.cfg.future_frames,
             training=False,
         )
 
-        self.test_loader = DataLoader(
-            test_dset,
-            batch_size=self.cfg.test_batch_size,
-            shuffle=False,
-            num_workers=num_workers,
-            collate_fn=seq_collate,
-            pin_memory=True,
-            persistent_workers=(num_workers > 0),
-            prefetch_factor=4,
-        )
+        # choose workers (honors explicit config, otherwise cores-based)
+        num_workers = self._choose_num_workers(config)
+        if num_workers > 0:
+            self.train_loader = DataLoader(
+                train_dset,
+                batch_size=self.cfg.train_batch_size,
+                shuffle=True,
+                num_workers=num_workers,
+                collate_fn=seq_collate,
+                pin_memory=(num_workers > 0),
+                persistent_workers=(num_workers > 0),
+                prefetch_factor=4,
+            )
+            self.test_loader = DataLoader(
+                test_dset,
+                batch_size=self.cfg.test_batch_size,
+                shuffle=False,
+                num_workers=num_workers,
+                collate_fn=seq_collate,
+                pin_memory=(num_workers > 0),
+                persistent_workers=(num_workers > 0),
+                prefetch_factor=4,
+            )
+        else:
+            self.train_loader = DataLoader(
+                train_dset,
+                batch_size=self.cfg.train_batch_size,
+                shuffle=True,
+                num_workers=num_workers,
+                collate_fn=seq_collate,
+                pin_memory=False,
+                persistent_workers=False,
+            )
+            self.test_loader = DataLoader(
+                test_dset,
+                batch_size=self.cfg.test_batch_size,
+                shuffle=False,
+                num_workers=num_workers,
+                collate_fn=seq_collate,
+                pin_memory=False,
+                persistent_workers=False,
+            )
 
         # data normalization parameters (create directly on target device)
         self.traj_mean = (
@@ -172,6 +195,43 @@ class Trainer:
             self.log,
         )
         return None
+
+    def tensor_stats(self):
+        """Compute a lightweight summary of live torch tensors and log it.
+
+        This is intended as a diagnostic to see whether live tensor count/bytes
+        grows across batches (indicating a leak) vs allocator-reserved memory.
+        """
+        try:
+            import gc
+
+            gc.collect()
+            objs = gc.get_objects()
+        except Exception:
+            print_log("tensor_stats: gc.get_objects() failed", self.log)
+            return
+
+        cnt = 0
+        bytes_total = 0
+        by_shape = {}
+        for o in objs:
+            try:
+                # torch.is_tensor sometimes throws for non-torch objects; guard
+                if torch.is_tensor(o):
+                    cnt += 1
+                    bytes_total += o.element_size() * o.nelement()
+                    s = tuple(o.size())
+                    by_shape[s] = by_shape.get(s, 0) + 1
+            except Exception:
+                continue
+
+        msg = (
+            f"Live torch tensors: {cnt}, approx bytes: {bytes_total / (1024**2):.1f} MB"
+        )
+        print_log(msg, self.log)
+        if len(by_shape) > 0:
+            top = sorted(by_shape.items(), key=lambda x: -x[1])[:10]
+            print_log(f"Top tensor shapes (count): {top}", self.log)
 
     def _choose_num_workers(self, config):
         """Simplified workers selection.
@@ -408,6 +468,11 @@ class Trainer:
                 }
                 torch.save(model_cp, cp_path)
             self.scheduler_model.step()
+
+        torch.cuda.empty_cache()
+
+        gc.collect()
+        print("Training complete.")
 
     def data_preprocess(self, data):
         """
@@ -659,8 +724,8 @@ class Trainer:
 
                 raise ValueError
 
-    def test_single_model(self):
-        model_path = "./results/checkpoints/led_new.p"
+    def test_single_model(self, path_model=None):
+        model_path = path_model if path_model else "./results/checkpoints/led_new.p"
         model_dict = torch.load(model_path, map_location=torch.device("cpu"))[
             "model_initializer_dict"
         ]

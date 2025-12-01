@@ -7,7 +7,10 @@ import os
 def parse_config():
     parser = argparse.ArgumentParser()
     parser.add_argument("--cuda", default=True)
-    parser.add_argument("--learning_rate", type=int, default=0.002)
+    parser.add_argument("--learning_rate", type=float, default=0.002)
+    parser.add_argument(
+        "--use_amp", action="store_true", help="Enable AMP mixed precision"
+    )
     parser.add_argument("--max_epochs", type=int, default=128)
 
     parser.add_argument("--cfg", default="led_augment")
@@ -31,7 +34,46 @@ def parse_config():
 def main(config):
     t = led.Trainer(config)
     if config.train == 1:
-        t.fit()
+        # Profile the training run and export a chrome trace
+        # Clear caches and reset peak stats
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+
+        print("Starting profiler and running fit() ...")
+        with torch.autograd.profiler.profile(
+            use_cuda=True, record_shapes=True, profile_memory=True, with_stack=True
+        ) as prof:
+            try:
+                t.fit()
+                print("Training finished successfully.")
+            except Exception as e:
+                print("Exception during fit():", e)
+                raise
+            print("Training fit() completed, exiting profiler.")
+
+        if torch.cuda.is_available():
+            print("Synchronizing CUDA ...")
+            torch.cuda.synchronize()
+            print(
+                "Max GPU memory allocated (bytes):", torch.cuda.max_memory_allocated()
+            )
+
+        # Print a short summary and export trace
+        try:
+            print(
+                prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=50)
+            )
+        except Exception:
+            print("no summary table.")
+
+        out_path = os.path.join(os.getcwd(), "trace_reproduce_train.json")
+        try:
+            print("exporting chrome trace ...")
+            prof.export_chrome_trace(out_path)
+            print("Exported chrome trace to:", out_path)
+        except Exception as e:
+            print("Could not export chrome trace:", e)
     else:
         # t.save_data()
         # t.test_single_model()

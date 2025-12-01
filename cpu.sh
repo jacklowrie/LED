@@ -1,0 +1,1 @@
+top -c -p `pgrep -d ',' --ful ".venv/bin/python"`
